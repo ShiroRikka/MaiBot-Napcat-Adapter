@@ -64,26 +64,73 @@ def check_napcat_server_token(conn, request):
     return None
 
 async def napcat_server():
-    logger.info("正在启动adapter...")
-    async with Server.serve(message_recv, global_config.napcat_server.host, global_config.napcat_server.port, max_size=2**26, process_request=check_napcat_server_token) as server:
-        logger.info(
-            f"Adapter已启动，监听地址: ws://{global_config.napcat_server.host}:{global_config.napcat_server.port}"
-        )
-        await server.serve_forever()
-
-
-async def graceful_shutdown():
+    logger.info("正在启动 MaiBot-Napcat-Adapter...")
+    logger.debug(f"日志等级: {global_config.debug.level}")
+    logger.debug("日志文件: logs/adapter_*.log")
     try:
-        logger.info("正在关闭adapter...")
+        async with Server.serve(
+            message_recv, 
+            global_config.napcat_server.host, 
+            global_config.napcat_server.port, 
+            max_size=2**26, 
+            process_request=check_napcat_server_token
+        ) as server:
+            logger.success(
+                f"✅ Adapter 启动成功! 监听: ws://{global_config.napcat_server.host}:{global_config.napcat_server.port}"
+            )
+            await server.serve_forever()
+    except OSError:
+        # 端口绑定失败时抛出异常让外层处理
+        raise
+
+
+async def graceful_shutdown(silent: bool = False):
+    """
+    优雅关闭adapter
+    Args:
+        silent: 静默模式,控制台不输出日志,但仍记录到文件
+    """
+    try:
+        if not silent:
+            logger.info("正在关闭adapter...")
+        else:
+            logger.debug("正在清理资源...")
+        
+        # 先关闭MMC连接
+        try:
+            await asyncio.wait_for(mmc_stop_com(), timeout=3)
+        except asyncio.TimeoutError:
+            logger.debug("关闭MMC连接超时")
+        except Exception as e:
+            logger.debug(f"关闭MMC连接时出现错误: {e}")
+        
+        # 取消所有任务
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        if tasks:
+            logger.debug(f"正在取消 {len(tasks)} 个任务")
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 15)
-        await mmc_stop_com()  # 后置避免神秘exception
-        logger.info("Adapter已成功关闭")
+        
+        # 等待任务完成,记录异常到日志文件
+        if tasks:
+            try:
+                results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3)
+                # 记录任务取消的详细信息到日志文件
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        logger.debug(f"任务 {i+1} 清理时产生异常: {type(result).__name__}: {result}")
+            except asyncio.TimeoutError:
+                logger.debug("任务清理超时")
+            except Exception as e:
+                logger.debug(f"任务清理时出现错误: {e}")
+        
+        if not silent:
+            logger.info("Adapter已成功关闭")
+        else:
+            logger.debug("资源清理完成")
     except Exception as e:
-        logger.error(f"Adapter关闭中出现错误: {e}")
+        logger.debug(f"graceful_shutdown异常: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
@@ -93,11 +140,57 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         logger.warning("收到中断信号，正在优雅关闭...")
-        loop.run_until_complete(graceful_shutdown())
+        try:
+            loop.run_until_complete(graceful_shutdown(silent=False))
+        except Exception:
+            pass
+    except OSError as e:
+        # 处理端口占用等网络错误
+        if e.errno == 10048 or "address already in use" in str(e).lower():
+            logger.error(f"❌ 端口 {global_config.napcat_server.port} 已被占用，请检查:")
+            logger.error("   1. 是否有其他 MaiBot-Napcat-Adapter 实例正在运行")
+            logger.error("   2. 修改 config.toml 中的 port 配置")
+            logger.error(f"   3. 使用命令查看占用进程: netstat -ano | findstr {global_config.napcat_server.port}")
+            logger.debug("完整错误信息:", exc_info=True)
+        else:
+            logger.error(f"❌ 网络错误: {str(e)}")
+            logger.debug("完整错误信息:", exc_info=True)
+        # 端口占用时静默清理(控制台不输出,但记录到日志文件)
+        try:
+            loop.run_until_complete(graceful_shutdown(silent=True))
+        except Exception as e:
+            logger.debug(f"清理资源时出现错误: {e}", exc_info=True)
+        sys.exit(1)
     except Exception as e:
-        logger.exception(f"主程序异常: {str(e)}")
+        logger.error(f"❌ 主程序异常: {str(e)}")
+        logger.debug("详细错误信息:", exc_info=True)
+        try:
+            loop.run_until_complete(graceful_shutdown(silent=True))
+        except Exception as e:
+            logger.debug(f"清理资源时出现错误: {e}", exc_info=True)
         sys.exit(1)
     finally:
-        if loop and not loop.is_closed():
-            loop.close()
+        # 清理事件循环
+        try:
+            # 取消所有剩余任务
+            pending = asyncio.all_tasks(loop)
+            if pending:
+                logger.debug(f"finally块清理 {len(pending)} 个剩余任务")
+                for task in pending:
+                    task.cancel()
+                # 给任务一点时间完成取消
+                try:
+                    results = loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    # 记录清理结果到日志文件
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                            logger.debug(f"剩余任务 {i+1} 清理异常: {type(result).__name__}: {result}")
+                except Exception as e:
+                    logger.debug(f"清理剩余任务时出现错误: {e}")
+        except Exception as e:
+            logger.debug(f"finally块清理出现错误: {e}")
+        finally:
+            if loop and not loop.is_closed():
+                logger.debug("关闭事件循环")
+                loop.close()
         sys.exit(0)

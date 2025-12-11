@@ -300,7 +300,23 @@ class MessageHandler:
                     else:
                         logger.warning("record处理失败或不支持")
                 case RealMessageType.video:
-                    logger.warning("不支持视频解析")
+                    ret_seg = await self.handle_video_message(sub_message)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("video处理失败")
+                case RealMessageType.json:
+                    ret_seg = await self.handle_json_message(sub_message)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("json处理失败")
+                case RealMessageType.file:
+                    ret_seg = await self.handle_file_message(sub_message)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("file处理失败")
                 case RealMessageType.at:
                     ret_seg = await self.handle_at_message(
                         sub_message,
@@ -445,6 +461,77 @@ class MessageHandler:
             return None
         return Seg(type="voice", data=audio_base64)
 
+    async def handle_video_message(self, raw_message: dict) -> Seg | None:
+        """
+        处理视频消息
+        Parameters:
+            raw_message: dict: 原始消息
+        Returns:
+            seg_data: Seg: 处理后的消息段
+        """
+        message_data: dict = raw_message.get("data")
+        file: str = message_data.get("file")
+        url: str = message_data.get("url")
+        file_size: str = message_data.get("file_size", "未知大小")
+        
+        if not file:
+            logger.warning("视频消息缺少文件信息")
+            return None
+        
+        # 视频消息返回文本描述，包含文件名和大小
+        video_text = f"[视频: {file}, 大小: {file_size}字节]"
+        if url:
+            video_text += f"\n视频链接: {url}"
+        
+        return Seg(type="text", data=video_text)
+
+    async def handle_json_message(self, raw_message: dict) -> Seg | None:
+        """
+        处理JSON卡片消息(小程序、分享等)
+        Parameters:
+            raw_message: dict: 原始消息
+        Returns:
+            seg_data: Seg: 处理后的消息段
+        """
+        message_data: dict = raw_message.get("data")
+        json_data: str = message_data.get("data")
+        
+        if not json_data:
+            logger.warning("JSON消息缺少数据")
+            return None
+        
+        try:
+            # 尝试解析JSON获取prompt提示信息
+            parsed_json = json.loads(json_data)
+            prompt = parsed_json.get("prompt", "[卡片消息]")
+            return Seg(type="text", data=prompt)
+        except json.JSONDecodeError:
+            logger.warning("JSON消息解析失败")
+            return Seg(type="text", data="[卡片消息]")
+
+    async def handle_file_message(self, raw_message: dict) -> Seg | None:
+        """
+        处理文件消息
+        Parameters:
+            raw_message: dict: 原始消息
+        Returns:
+            seg_data: Seg: 处理后的消息段
+        """
+        message_data: dict = raw_message.get("data")
+        file_name: str = message_data.get("file")
+        file_size: str = message_data.get("file_size", "未知大小")
+        file_url: str = message_data.get("url")
+        
+        if not file_name:
+            logger.warning("文件消息缺少文件名")
+            return None
+        
+        file_text = f"[文件: {file_name}, 大小: {file_size}字节]"
+        if file_url:
+            file_text += f"\n文件链接: {file_url}"
+        
+        return Seg(type="text", data=file_text)
+
     async def handle_reply_message(self, raw_message: dict, additional_config: dict) -> Tuple[List[Seg] | None, dict]:
         # sourcery skip: move-assign-in-block, use-named-expression
         """
@@ -489,18 +576,25 @@ class MessageHandler:
         image_count: int
         if not handled_message:
             return None
+        
+        # 添加转发消息的标题和结束标识
+        forward_header = Seg(type="text", data="========== 转发消息开始 ==========\n")
+        forward_footer = Seg(type="text", data="========== 转发消息结束 ==========")
+        
         if image_count < 5 and image_count > 0:
             # 处理图片数量小于5的情况，此时解析图片为base64
             logger.trace("图片数量小于5，开始解析图片为base64")
-            return await self._recursive_parse_image_seg(handled_message, True)
+            parsed_message = await self._recursive_parse_image_seg(handled_message, True)
+            return Seg(type="seglist", data=[forward_header, parsed_message, forward_footer])
         elif image_count > 0:
             logger.trace("图片数量大于等于5，开始解析图片为占位符")
             # 处理图片数量大于等于5的情况，此时解析图片为占位符
-            return await self._recursive_parse_image_seg(handled_message, False)
+            parsed_message = await self._recursive_parse_image_seg(handled_message, False)
+            return Seg(type="seglist", data=[forward_header, parsed_message, forward_footer])
         else:
             # 处理没有图片的情况，此时直接返回
             logger.trace("没有图片，直接返回")
-            return handled_message
+            return Seg(type="seglist", data=[forward_header, handled_message, forward_footer])
 
     async def _recursive_parse_image_seg(self, seg_data: Seg, to_image: bool) -> Seg:
         # sourcery skip: merge-else-if-into-elif

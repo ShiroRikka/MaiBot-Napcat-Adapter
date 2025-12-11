@@ -87,12 +87,13 @@ class NoticeHandler:
         match notice_type:
             case NoticeType.friend_recall:
                 logger.info("好友撤回一条消息")
-                logger.info(f"撤回消息ID：{raw_message.get('message_id')}, 撤回时间：{raw_message.get('time')}")
-                logger.warning("暂时不支持撤回消息处理")
+                handled_message, user_info = await self.handle_friend_recall_notify(raw_message)
             case NoticeType.group_recall:
+                if not await message_handler.check_allow_to_chat(user_id, group_id, True, False):
+                    return None
                 logger.info("群内用户撤回一条消息")
-                logger.info(f"撤回消息ID：{raw_message.get('message_id')}, 撤回时间：{raw_message.get('time')}")
-                logger.warning("暂时不支持撤回消息处理")
+                handled_message, user_info = await self.handle_group_recall_notify(raw_message, group_id, user_id)
+                system_notice = True
             case NoticeType.notify:
                 sub_type = raw_message.get("sub_type")
                 match sub_type:
@@ -123,6 +124,37 @@ class NoticeHandler:
                         system_notice = True
                     case _:
                         logger.warning(f"不支持的group_ban类型: {notice_type}.{sub_type}")
+            case NoticeType.group_msg_emoji_like:
+                if not await message_handler.check_allow_to_chat(user_id, group_id, True, False):
+                    return None
+                logger.info("处理群消息表情回应")
+                handled_message, user_info = await self.handle_emoji_like_notify(raw_message, group_id, user_id)
+            case NoticeType.group_upload:
+                if not await message_handler.check_allow_to_chat(user_id, group_id, True, False):
+                    return None
+                logger.info("处理群文件上传")
+                handled_message, user_info = await self.handle_group_upload_notify(raw_message, group_id, user_id)
+                system_notice = True
+            case NoticeType.group_increase:
+                sub_type = raw_message.get("sub_type")
+                logger.info(f"处理群成员增加: {sub_type}")
+                handled_message, user_info = await self.handle_group_increase_notify(raw_message, group_id, user_id)
+                system_notice = True
+            case NoticeType.group_decrease:
+                sub_type = raw_message.get("sub_type")
+                logger.info(f"处理群成员减少: {sub_type}")
+                handled_message, user_info = await self.handle_group_decrease_notify(raw_message, group_id, user_id)
+                system_notice = True
+            case NoticeType.group_admin:
+                sub_type = raw_message.get("sub_type")
+                logger.info(f"处理群管理员变动: {sub_type}")
+                handled_message, user_info = await self.handle_group_admin_notify(raw_message, group_id, user_id)
+                system_notice = True
+            case NoticeType.essence:
+                sub_type = raw_message.get("sub_type")
+                logger.info(f"处理精华消息: {sub_type}")
+                handled_message, user_info = await self.handle_essence_notify(raw_message, group_id)
+                system_notice = True
             case _:
                 logger.warning(f"不支持的notice类型: {notice_type}")
                 return None
@@ -238,6 +270,322 @@ class NoticeHandler:
             type="text",
             data=f"{display_name}{first_txt}{target_name}{second_txt}（这是QQ的一个功能，用于提及某人，但没那么明显）",
         )
+        return seg_data, user_info
+
+    async def handle_friend_recall_notify(self, raw_message: dict) -> Tuple[Seg | None, UserInfo | None]:
+        """处理好友消息撤回"""
+        user_id = raw_message.get("user_id")
+        message_id = raw_message.get("message_id")
+        
+        if not user_id:
+            logger.error("用户ID不能为空，无法处理好友撤回通知")
+            return None, None
+        
+        # 获取好友信息
+        user_qq_info: dict = await get_stranger_info(self.server_connection, user_id)
+        if user_qq_info:
+            user_name = user_qq_info.get("nickname")
+        else:
+            user_name = "QQ用户"
+            logger.warning("无法获取撤回消息好友的昵称")
+        
+        user_info = UserInfo(
+            platform=global_config.maibot_server.platform_name,
+            user_id=user_id,
+            user_nickname=user_name,
+            user_cardname=None,
+        )
+        
+        seg_data = Seg(
+            type="notify",
+            data={
+                "sub_type": "friend_recall",
+                "message_id": message_id,
+            },
+        )
+        
+        return seg_data, user_info
+    
+    async def handle_group_recall_notify(
+        self, raw_message: dict, group_id: int, user_id: int
+    ) -> Tuple[Seg | None, UserInfo | None]:
+        """处理群消息撤回"""
+        if not group_id:
+            logger.error("群ID不能为空，无法处理群撤回通知")
+            return None, None
+        
+        message_id = raw_message.get("message_id")
+        operator_id = raw_message.get("operator_id")
+        
+        # 获取撤回操作者信息
+        operator_nickname: str = None
+        operator_cardname: str = None
+        
+        member_info: dict = await get_member_info(self.server_connection, group_id, operator_id)
+        if member_info:
+            operator_nickname = member_info.get("nickname")
+            operator_cardname = member_info.get("card")
+        else:
+            logger.warning("无法获取撤回操作者的昵称")
+            operator_nickname = "QQ用户"
+        
+        operator_info = UserInfo(
+            platform=global_config.maibot_server.platform_name,
+            user_id=operator_id,
+            user_nickname=operator_nickname,
+            user_cardname=operator_cardname,
+        )
+        
+        # 获取被撤回消息发送者信息（如果不是自己撤回的话）
+        recalled_user_info: UserInfo | None = None
+        if user_id != operator_id:
+            user_member_info: dict = await get_member_info(self.server_connection, group_id, user_id)
+            if user_member_info:
+                user_nickname = user_member_info.get("nickname")
+                user_cardname = user_member_info.get("card")
+            else:
+                user_nickname = "QQ用户"
+                user_cardname = None
+                logger.warning("无法获取被撤回消息发送者的昵称")
+            
+            recalled_user_info = UserInfo(
+                platform=global_config.maibot_server.platform_name,
+                user_id=user_id,
+                user_nickname=user_nickname,
+                user_cardname=user_cardname,
+            )
+        
+        seg_data = Seg(
+            type="notify",
+            data={
+                "sub_type": "group_recall",
+                "message_id": message_id,
+                "recalled_user_info": recalled_user_info.to_dict() if recalled_user_info else None,
+            },
+        )
+        
+        return seg_data, operator_info
+
+    async def handle_emoji_like_notify(
+        self, raw_message: dict, group_id: int, user_id: int
+    ) -> Tuple[Seg | None, UserInfo | None]:
+        """处理群消息表情回应"""
+        if not group_id:
+            logger.error("群ID不能为空，无法处理表情回应通知")
+            return None, None
+
+        # 获取用户信息
+        user_qq_info: dict = await get_member_info(self.server_connection, group_id, user_id)
+        if user_qq_info:
+            user_name = user_qq_info.get("nickname")
+            user_cardname = user_qq_info.get("card")
+        else:
+            user_name = "QQ用户"
+            user_cardname = "QQ用户"
+            logger.warning("无法获取表情回应用户的昵称")
+
+        # 解析表情列表
+        likes = raw_message.get("likes", [])
+        message_id = raw_message.get("message_id")
+
+        # 构建表情文本
+        emoji_texts = []
+        # QQ 官方表情映射表 (EmojiType=1 为 QQ 系统表情，EmojiType=2 为 Emoji Unicode)
+        emoji_map = {
+            # QQ 系统表情 (Type 1)
+            "4": "得意",
+            "5": "流泪",
+            "8": "睡",
+            "9": "大哭",
+            "10": "尴尬",
+            "12": "调皮",
+            "14": "微笑",
+            "16": "酷",
+            "21": "可爱",
+            "23": "傲慢",
+            "24": "饥饿",
+            "25": "困",
+            "26": "惊恐",
+            "27": "流汗",
+            "28": "憨笑",
+            "29": "悠闲",
+            "30": "奋斗",
+            "32": "疑问",
+            "33": "嘘",
+            "34": "晕",
+            "38": "敲打",
+            "39": "再见",
+            "41": "发抖",
+            "42": "爱情",
+            "43": "跳跳",
+            "49": "拥抱",
+            "53": "蛋糕",
+            "60": "咖啡",
+            "63": "玫瑰",
+            "66": "爱心",
+            "74": "太阳",
+            "75": "月亮",
+            "76": "赞",
+            "78": "握手",
+            "79": "胜利",
+            "85": "飞吻",
+            "89": "西瓜",
+            "96": "冷汗",
+            "97": "擦汗",
+            "98": "抠鼻",
+            "99": "鼓掌",
+            "100": "糗大了",
+            "101": "坏笑",
+            "102": "左哼哼",
+            "103": "右哼哼",
+            "104": "哈欠",
+            "106": "委屈",
+            "109": "左亲亲",
+            "111": "可怜",
+            "116": "示爱",
+            "118": "抱拳",
+            "120": "拳头",
+            "122": "爱你",
+            "123": "NO",
+            "124": "OK",
+            "125": "转圈",
+            "129": "挥手",
+            "144": "喝彩",
+            "147": "棒棒糖",
+            "171": "茶",
+            "173": "泪奔",
+            "174": "无奈",
+            "175": "卖萌",
+            "176": "小纠结",
+            "179": "doge",
+            "180": "惊喜",
+            "181": "骚扰",
+            "182": "笑哭",
+            "183": "我最美",
+            "201": "点赞",
+            "203": "托脸",
+            "212": "托腮",
+            "214": "啵啵",
+            "219": "蹭一蹭",
+            "222": "抱抱",
+            "227": "拍手",
+            "232": "佛系",
+            "240": "喷脸",
+            "243": "甩头",
+            "246": "加油抱抱",
+            "262": "脑阔疼",
+            "264": "捂脸",
+            "265": "辣眼睛",
+            "266": "哦哟",
+            "267": "头秃",
+            "268": "问号脸",
+            "269": "暗中观察",
+            "270": "emm",
+            "271": "吃瓜",
+            "272": "呵呵哒",
+            "273": "我酸了",
+            "277": "汪汪",
+            "278": "汗",
+            "281": "无眼笑",
+            "282": "敬礼",
+            "284": "面无表情",
+            "285": "摸鱼",
+            "287": "哦",
+            "289": "睁眼",
+            "290": "敲开心",
+            "293": "摸锦鲤",
+            "294": "期待",
+            "297": "拜谢",
+            "298": "元宝",
+            "299": "牛啊",
+            "305": "右亲亲",
+            "306": "牛气冲天",
+            "307": "喵喵",
+            "314": "仔细分析",
+            "315": "加油",
+            "318": "崇拜",
+            "319": "比心",
+            "320": "庆祝",
+            "322": "拒绝",
+            "324": "吃糖",
+            "326": "生气",
+            # Unicode Emoji (Type 2)
+            "9728": "☀",
+            "9749": "☕",
+            "9786": "☺",
+            "10024": "✨",
+            "10060": "❌",
+            "10068": "❔",
+            "127801": "🌹",
+            "127817": "🍉",
+            "127822": "🍎",
+            "127827": "🍓",
+            "127836": "🍜",
+            "127838": "🍞",
+            "127847": "🍧",
+            "127866": "🍺",
+            "127867": "🍻",
+            "127881": "🎉",
+            "128027": "🐛",
+            "128046": "🐮",
+            "128051": "🐳",
+            "128053": "🐵",
+            "128074": "👊",
+            "128076": "👌",
+            "128077": "👍",
+            "128079": "👏",
+            "128089": "👙",
+            "128102": "👦",
+            "128104": "👨",
+            "128147": "💓",
+            "128157": "💝",
+            "128164": "💤",
+            "128166": "💦",
+            "128168": "💨",
+            "128170": "💪",
+            "128235": "📫",
+            "128293": "🔥",
+            "128513": "😁",
+            "128514": "😂",
+            "128516": "😄",
+            "128522": "😊",
+            "128524": "😌",
+            "128527": "😏",
+            "128530": "😒",
+            "128531": "😓",
+            "128532": "😔",
+            "128536": "😘",
+            "128538": "😚",
+            "128540": "😜",
+            "128541": "😝",
+            "128557": "😭",
+            "128560": "😰",
+            "128563": "😳",
+        }
+
+        for like in likes:
+            emoji_id = like.get("emoji_id", "")
+            count = like.get("count", 1)
+            emoji = emoji_map.get(emoji_id, f"表情{emoji_id}")
+            if count > 1:
+                emoji_texts.append(f"{emoji}x{count}")
+            else:
+                emoji_texts.append(emoji)
+
+        emoji_str = "、".join(emoji_texts) if emoji_texts else "未知表情"
+        display_name = user_cardname if user_cardname and user_cardname != "QQ用户" else user_name
+
+        # 构建消息文本
+        message_text = f"{display_name} 对消息(ID:{message_id})表达了 {emoji_str}"
+
+        user_info = UserInfo(
+            platform=global_config.maibot_server.platform_name,
+            user_id=user_id,
+            user_nickname=user_name,
+            user_cardname=user_cardname,
+        )
+
+        seg_data = Seg(type="text", data=message_text)
         return seg_data, user_info
 
     async def handle_ban_notify(self, raw_message: dict, group_id: int) -> Tuple[Seg, UserInfo] | Tuple[None, None]:
@@ -511,6 +859,257 @@ class NoticeHandler:
                 logger.error(f"发送通知消息失败: {str(e)}")
                 await unsuccessful_notice_queue.put(to_be_send)
             await asyncio.sleep(1)
+
+    async def handle_group_upload_notify(
+        self, raw_message: dict, group_id: int, user_id: int
+    ) -> Tuple[Seg | None, UserInfo | None]:
+        """
+        处理群文件上传通知
+        """
+        file_info: dict = raw_message.get("file", {})
+        file_name = file_info.get("name", "未知文件")
+        file_size = file_info.get("size", 0)
+        file_id = file_info.get("id", "")
+
+        user_qq_info: dict = await get_member_info(self.server_connection, group_id, user_id)
+        if user_qq_info:
+            user_name = user_qq_info.get("nickname")
+            user_cardname = user_qq_info.get("card")
+        else:
+            logger.warning("无法获取上传者信息")
+            user_name = "QQ用户"
+            user_cardname = None
+
+        user_info = UserInfo(
+            platform=global_config.maibot_server.platform_name,
+            user_id=user_id,
+            user_nickname=user_name,
+            user_cardname=user_cardname,
+        )
+
+        # 格式化文件大小
+        if file_size < 1024:
+            size_str = f"{file_size}B"
+        elif file_size < 1024 * 1024:
+            size_str = f"{file_size / 1024:.2f}KB"
+        else:
+            size_str = f"{file_size / (1024 * 1024):.2f}MB"
+
+        notify_seg = Seg(
+            type="notify",
+            data={
+                "sub_type": "group_upload",
+                "file_name": file_name,
+                "file_size": size_str,
+                "file_id": file_id,
+            },
+        )
+
+        return notify_seg, user_info
+
+    async def handle_group_increase_notify(
+        self, raw_message: dict, group_id: int, user_id: int
+    ) -> Tuple[Seg | None, UserInfo | None]:
+        """
+        处理群成员增加通知
+        """
+        sub_type = raw_message.get("sub_type")
+        operator_id = raw_message.get("operator_id")
+
+        # 获取新成员信息
+        user_qq_info: dict = await get_member_info(self.server_connection, group_id, user_id)
+        if user_qq_info:
+            user_name = user_qq_info.get("nickname")
+            user_cardname = user_qq_info.get("card")
+        else:
+            logger.warning("无法获取新成员信息")
+            user_name = "QQ用户"
+            user_cardname = None
+
+        user_info = UserInfo(
+            platform=global_config.maibot_server.platform_name,
+            user_id=user_id,
+            user_nickname=user_name,
+            user_cardname=user_cardname,
+        )
+
+        # 获取操作者信息
+        operator_name = "未知"
+        if operator_id:
+            operator_info: dict = await get_member_info(self.server_connection, group_id, operator_id)
+            if operator_info:
+                operator_name = operator_info.get("card") or operator_info.get("nickname", "未知")
+
+        if sub_type == NoticeType.GroupIncrease.invite:
+            action_text = f"被 {operator_name} 邀请"
+        elif sub_type == NoticeType.GroupIncrease.approve:
+            action_text = f"经 {operator_name} 同意"
+        else:
+            action_text = "加入"
+
+        notify_seg = Seg(
+            type="notify",
+            data={
+                "sub_type": "group_increase",
+                "action": action_text,
+                "increase_type": sub_type,
+                "operator_id": operator_id,
+            },
+        )
+
+        return notify_seg, user_info
+
+    async def handle_group_decrease_notify(
+        self, raw_message: dict, group_id: int, user_id: int
+    ) -> Tuple[Seg | None, UserInfo | None]:
+        """
+        处理群成员减少通知
+        """
+        sub_type = raw_message.get("sub_type")
+        operator_id = raw_message.get("operator_id")
+
+        # 获取离开成员信息
+        user_qq_info: dict = await get_member_info(self.server_connection, group_id, user_id)
+        if user_qq_info:
+            user_name = user_qq_info.get("nickname")
+            user_cardname = user_qq_info.get("card")
+        else:
+            logger.warning("无法获取离开成员信息")
+            user_name = "QQ用户"
+            user_cardname = None
+
+        user_info = UserInfo(
+            platform=global_config.maibot_server.platform_name,
+            user_id=user_id,
+            user_nickname=user_name,
+            user_cardname=user_cardname,
+        )
+
+        # 获取操作者信息
+        operator_name = "未知"
+        if operator_id and operator_id != 0:
+            operator_info: dict = await get_member_info(self.server_connection, group_id, operator_id)
+            if operator_info:
+                operator_name = operator_info.get("card") or operator_info.get("nickname", "未知")
+
+        if sub_type == NoticeType.GroupDecrease.leave:
+            action_text = "主动退群"
+        elif sub_type == NoticeType.GroupDecrease.kick:
+            action_text = f"被 {operator_name} 踢出"
+        elif sub_type == NoticeType.GroupDecrease.kick_me:
+            action_text = "机器人被踢出"
+        else:
+            action_text = "离开群聊"
+
+        notify_seg = Seg(
+            type="notify",
+            data={
+                "sub_type": "group_decrease",
+                "action": action_text,
+                "decrease_type": sub_type,
+                "operator_id": operator_id,
+            },
+        )
+
+        return notify_seg, user_info
+
+    async def handle_group_admin_notify(
+        self, raw_message: dict, group_id: int, user_id: int
+    ) -> Tuple[Seg | None, UserInfo | None]:
+        """
+        处理群管理员变动通知
+        """
+        sub_type = raw_message.get("sub_type")
+
+        # 获取目标用户信息
+        user_qq_info: dict = await get_member_info(self.server_connection, group_id, user_id)
+        if user_qq_info:
+            user_name = user_qq_info.get("nickname")
+            user_cardname = user_qq_info.get("card")
+        else:
+            logger.warning("无法获取目标用户信息")
+            user_name = "QQ用户"
+            user_cardname = None
+
+        user_info = UserInfo(
+            platform=global_config.maibot_server.platform_name,
+            user_id=user_id,
+            user_nickname=user_name,
+            user_cardname=user_cardname,
+        )
+
+        if sub_type == NoticeType.GroupAdmin.set:
+            action_text = "被设置为管理员"
+        elif sub_type == NoticeType.GroupAdmin.unset:
+            action_text = "被取消管理员"
+        else:
+            action_text = "管理员变动"
+
+        notify_seg = Seg(
+            type="notify",
+            data={
+                "sub_type": "group_admin",
+                "action": action_text,
+                "admin_type": sub_type,
+            },
+        )
+
+        return notify_seg, user_info
+
+    async def handle_essence_notify(
+        self, raw_message: dict, group_id: int
+    ) -> Tuple[Seg | None, UserInfo | None]:
+        """
+        处理精华消息通知
+        """
+        sub_type = raw_message.get("sub_type")
+        sender_id = raw_message.get("sender_id")
+        operator_id = raw_message.get("operator_id")
+        message_id = raw_message.get("message_id")
+
+        # 获取操作者信息(设置精华的人)
+        operator_info: dict = await get_member_info(self.server_connection, group_id, operator_id)
+        if operator_info:
+            operator_name = operator_info.get("nickname")
+            operator_cardname = operator_info.get("card")
+        else:
+            logger.warning("无法获取操作者信息")
+            operator_name = "QQ用户"
+            operator_cardname = None
+
+        user_info = UserInfo(
+            platform=global_config.maibot_server.platform_name,
+            user_id=operator_id,
+            user_nickname=operator_name,
+            user_cardname=operator_cardname,
+        )
+
+        # 获取消息发送者信息
+        sender_name = "未知用户"
+        if sender_id:
+            sender_info: dict = await get_member_info(self.server_connection, group_id, sender_id)
+            if sender_info:
+                sender_name = sender_info.get("card") or sender_info.get("nickname", "未知用户")
+
+        if sub_type == NoticeType.Essence.add:
+            action_text = f"将 {sender_name} 的消息设为精华"
+        elif sub_type == NoticeType.Essence.delete:
+            action_text = f"移除了 {sender_name} 的精华消息"
+        else:
+            action_text = "精华消息变动"
+
+        notify_seg = Seg(
+            type="notify",
+            data={
+                "sub_type": "essence",
+                "action": action_text,
+                "essence_type": sub_type,
+                "sender_id": sender_id,
+                "message_id": message_id,
+            },
+        )
+
+        return notify_seg, user_info
 
 
 notice_handler = NoticeHandler()
