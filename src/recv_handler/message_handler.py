@@ -468,23 +468,23 @@ class MessageHandler:
         Parameters:
             raw_message: dict: 原始消息
         Returns:
-            seg_data: Seg: 处理后的消息段
+            seg_data: Seg: 处理后的消息段（video_card类型）
         """
         message_data: dict = raw_message.get("data")
-        file: str = message_data.get("file")
-        url: str = message_data.get("url")
-        file_size: str = message_data.get("file_size", "未知大小")
+        file: str = message_data.get("file", "")
+        url: str = message_data.get("url", "")
+        file_size: str = message_data.get("file_size", "")
         
         if not file:
             logger.warning("视频消息缺少文件信息")
             return None
         
-        # 视频消息返回文本描述，包含文件名和大小
-        video_text = f"[视频: {file}, 大小: {file_size}字节]"
-        if url:
-            video_text += f"\n视频链接: {url}"
-        
-        return Seg(type="text", data=video_text)
+        # 返回结构化的视频卡片数据
+        return Seg(type="video_card", data={
+            "file": file,
+            "file_size": file_size,
+            "url": url
+        })
 
     async def handle_json_message(self, raw_message: dict) -> Seg | None:
         """
@@ -544,13 +544,44 @@ class MessageHandler:
                 # 尝试从music字段提取信息
                 if music:
                     title = music.get("title", "")
-                    singer = music.get("singer", "")
-                    music_text = "[音乐卡片]"
-                    if title:
-                        music_text += f"\n歌曲: {title}"
-                    if singer:
-                        music_text += f"\n歌手: {singer}"
-                    return Seg(type="text", data=music_text)
+                    singer = music.get("desc", "") or music.get("singer", "")
+                    jump_url = music.get("jumpUrl", "") or music.get("jump_url", "")
+                    music_url = music.get("musicUrl", "") or music.get("music_url", "")
+                    tag = music.get("tag", "")  # 音乐来源标签，如"网易云音乐"
+                    preview = music.get("preview", "")  # 封面图URL
+                    
+                    # 返回结构化的音乐卡片数据
+                    return Seg(type="music_card", data={
+                        "title": title,
+                        "singer": singer,
+                        "jump_url": jump_url,
+                        "music_url": music_url,
+                        "tag": tag,
+                        "preview": preview
+                    })
+            
+            # 检查是否为小程序分享（如B站视频分享）
+            if app == "com.tencent.miniapp_01":
+                meta = parsed_json.get("meta", {})
+                detail = meta.get("detail_1", {})
+                
+                if detail:
+                    title = detail.get("title", "")  # 小程序名称，如"哔哩哔哩"
+                    desc = detail.get("desc", "")  # 分享内容描述
+                    url = detail.get("url", "")  # 小程序链接
+                    qqdocurl = detail.get("qqdocurl", "")  # 原始链接（如B站链接）
+                    preview = detail.get("preview", "")  # 预览图
+                    icon = detail.get("icon", "")  # 小程序图标
+                    
+                    # 返回结构化的小程序卡片数据
+                    return Seg(type="miniapp_card", data={
+                        "title": title,
+                        "desc": desc,
+                        "url": url,
+                        "source_url": qqdocurl,
+                        "preview": preview,
+                        "icon": icon
+                    })
             
             # 其他卡片消息使用prompt字段
             prompt = parsed_json.get("prompt", "[卡片消息]")
